@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import schema_salad.ref_resolver
 from subprocess32 import check_call, DEVNULL, CalledProcessError
@@ -8,7 +9,10 @@ import requests
 import urllib
 import logging
 
+from pprint import pprint
+
 from wes_service.util import visit
+from toil.wdl import wdl_parser
 from urllib import urlopen
 
 
@@ -66,17 +70,70 @@ def wf_info(workflow_path):
     return version, file_type.upper()
 
 
-def modify_jsonyaml_paths(jsonyaml_file):
+def find_asts(ast_root, name):
+        """
+        Finds an AST node with the given name and the entire subtree under it.
+        A function borrowed from scottfrazer.  Thank you Scott Frazer!
+        :param ast_root: The WDL AST.  The whole thing generally, but really
+                         any portion that you wish to search.
+        :param name: The name of the subtree you're looking for, like "Task".
+        :return: nodes representing the AST subtrees matching the "name" given.
+        """
+        nodes = []
+        if isinstance(ast_root, wdl_parser.AstList):
+            for node in ast_root:
+                nodes.extend(find_asts(node, name))
+        elif isinstance(ast_root, wdl_parser.Ast):
+            if ast_root.name == name:
+                nodes.append(ast_root)
+            for attr_name, attr in ast_root.attributes.items():
+                nodes.extend(find_asts(attr, name))
+        return nodes
+
+
+def get_wdl_inputs(wdl):
+    """
+    Return inputs specified in WDL descriptor, grouped by type.
+    """
+    wdl_ast = wdl_parser.parse(wdl.encode('utf-8')).ast()
+    workflow = find_asts(wdl_ast, 'Workflow')[0]
+    workflow_name = workflow.attr('name').source_string
+    decs = find_asts(workflow, 'Declaration')
+    wdl_inputs = {}
+    for dec in decs:
+        if (isinstance(dec.attr('type'), wdl_parser.Ast)
+            and 'name' in dec.attr('type').attributes):
+            dec_type = dec.attr('type').attr('name').source_string
+            dec_subtype = dec.attr('type').attr('subtype')[0].source_string
+            dec_name = '{}.{}'.format(workflow_name,
+                                      dec.attr('name').source_string)
+            wdl_inputs.setdefault(dec_subtype, []).append(dec_name)
+        elif hasattr(dec.attr('type'), 'source_string'):
+            dec_type = dec.attr('type').source_string
+            dec_name = '{}.{}'.format(workflow_name,
+                                      dec.attr('name').source_string)
+            wdl_inputs.setdefault(dec_type, []).append(dec_name)
+    return wdl_inputs
+
+
+def modify_jsonyaml_paths(jsonyaml_file, path_keys=None):
     """
     Changes relative paths in a json/yaml file to be relative
     to where the json/yaml file is located.
 
     :param jsonyaml_file: Path to a json/yaml file.
     """
-    loader = schema_salad.ref_resolver.Loader({
-        "location": {"@type": "@id"},
-        "path": {"@type": "@id"}
-    })
+    resolve_keys = {
+        "path": {"@type": "@id"},
+        'location': {"@type": "@id"}
+    }
+    if path_keys is not None:
+        res = urllib.urlopen(jsonyaml_file)
+        params_json = json.loads(res.read())
+        for k, v in params_json.items():
+            if k in path_keys and not ':' in v[0] and not ':' in v:
+                resolve_keys[k] = {"@type": "@id"}
+    loader = schema_salad.ref_resolver.Loader(resolve_keys)
     input_dict, _ = loader.resolve_ref(jsonyaml_file, checklinks=False)
     basedir = os.path.dirname(jsonyaml_file)
 
@@ -104,15 +161,22 @@ def build_wes_request(workflow_file, json_path, attachments=None):
     :return: A list of tuples formatted to be sent in a post to the wes-server (Swagger API).
     """
     workflow_file = "file://" + workflow_file if ":" not in workflow_file else workflow_file
+    wf_version, wf_type = wf_info(workflow_file)
+    
+    input_keys = None
+    if wf_type == 'WDL':
+        res = urllib.urlopen(workflow_file)
+        workflow_descriptor = res.read()
+        input_keys = get_wdl_inputs(workflow_descriptor)['File']
+
     if json_path.startswith("file://"):
         json_path = json_path[7:]
         with open(json_path) as f:
             wf_params = json.dumps(json.load(f))
     elif json_path.startswith("http"):
-        wf_params = modify_jsonyaml_paths(json_path)
+        wf_params = modify_jsonyaml_paths(json_path, path_keys=input_keys)
     else:
         wf_params = json_path
-    wf_version, wf_type = wf_info(workflow_file)
 
     parts = [("workflow_params", wf_params),
              ("workflow_type", wf_type),
@@ -121,9 +185,14 @@ def build_wes_request(workflow_file, json_path, attachments=None):
     if workflow_file.startswith("file://"):
         parts.append(("workflow_attachment", (os.path.basename(workflow_file[7:]), open(workflow_file[7:], "rb"))))
         parts.append(("workflow_url", os.path.basename(workflow_file[7:])))
+    elif workflow_file.startswith("http"):
+        parts.append(("workflow_attachment", (os.path.basename(workflow_file), urlopen(workflow_file).read())))
+        parts.append(("workflow_url", os.path.basename(workflow_file)))
     else:
         parts.append(("workflow_url", workflow_file))
 
+    base_path = os.path.dirname(workflow_file)
+    # print("\nWORKFLOW_FILE: {}\nBASE_PATH: {}\n".format(workflow_file, base_path))
     if attachments:
         for attachment in attachments:
             if attachment.startswith("file://"):
@@ -132,7 +201,8 @@ def build_wes_request(workflow_file, json_path, attachments=None):
             elif attachment.startswith("http"):
                 attach_f = urlopen(attachment)
 
-            parts.append(("workflow_attachment", (os.path.basename(attachment), attach_f)))
+            # parts.append(("workflow_attachment", (os.path.basename(attachment), attach_f)))
+            parts.append(("workflow_attachment", (re.sub(base_path+'/', '', attachment), attach_f)))
 
     return parts
 
@@ -215,7 +285,15 @@ class WESClient(object):
         postresult = requests.post("%s://%s/ga4gh/wes/v1/runs" % (self.proto, self.host),
                                    files=parts,
                                    headers=self.auth)
+        # print('')
+        # pprint(parts)
+        # print('')
+        # print(postresult.request.body)
+        run_id = json.loads(postresult.text)['run_id']
+        with open('logs/{}.request'.format(run_id), 'w') as f:
+            f.write(postresult.request.body)
         return wes_reponse(postresult)
+
 
     def cancel(self, run_id):
         """

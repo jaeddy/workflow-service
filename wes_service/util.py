@@ -48,8 +48,14 @@ class WESBackend(object):
         for k, ls in iterlists(connexion.request.files):
             for v in ls:
                 if k == "workflow_attachment":
-                    filename = secure_filename(v.filename)
-                    v.save(os.path.join(tempdir, filename))
+                    print v.filename
+                    prefix = ''
+                    if '/' in v.filename:
+                        prefix = os.path.dirname(v.filename)
+                        if not os.path.exists(os.path.join(tempdir, prefix)):
+                            os.makedirs(os.path.join(tempdir, prefix))
+                    filename = secure_filename(os.path.basename(v.filename))
+                    v.save(os.path.join(tempdir, prefix, filename))
                     body[k] = "file://%s" % tempdir  # Reference to tem working dir.
                 elif k in ("workflow_params", "tags", "workflow_engine_parameters"):
                     body[k] = json.loads(v.read())
