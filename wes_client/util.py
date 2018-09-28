@@ -199,7 +199,8 @@ class WESClient(object):
                                   headers=self.auth)
         return wes_reponse(postresult)
 
-    def run(self, wf, jsonyaml, attachments):
+
+    def run(self, wf, jsonyaml, attachments, parts=None):
         """
         Composes and sends a post request that signals the wes server to run a workflow.
 
@@ -212,12 +213,25 @@ class WESClient(object):
 
         :return: The body of the post result as a dictionary.
         """
-        attachments = list(expand_globs(attachments))
-        parts = build_wes_request(wf, jsonyaml, attachments)
+        if parts is None:
+            attachments = list(expand_globs(attachments))
+            parts = build_wes_request(wf, jsonyaml, attachments)
         postresult = requests.post("%s://%s/ga4gh/wes/v1/runs" % (self.proto, self.host),
                                    files=parts,
                                    headers=self.auth)
-        return wes_reponse(postresult)
+        try:
+            try:
+                run_id = json.loads(postresult.text)['run_id']
+            except KeyError:
+                raise ValueError
+            with open('logs/{}.request'.format(run_id), 'w') as f:
+                f.write(postresult.request.body)
+            return wes_reponse(postresult)
+        except ValueError:
+            with open('logs/failed.request', 'w') as f:
+                f.write(postresult.request.body)
+            return {'run_id': 'failed'}
+
 
     def cancel(self, run_id):
         """
